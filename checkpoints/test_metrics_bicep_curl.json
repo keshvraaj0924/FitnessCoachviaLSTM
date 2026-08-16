@@ -1,0 +1,11 @@
+{
+  "exercise": "bicep_curl",
+  "per_class_f1": {
+    "idle": 0.8086,
+    "concentric": 0.7435,
+    "eccentric": 0.7513
+  },
+  "macro_f1": 0.7678,
+  "rep_count_mae": 0.2,
+  "n_test_sequences": 100
+}

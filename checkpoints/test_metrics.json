@@ -1,0 +1,11 @@
+{
+  "exercise": "jumping_jack",
+  "per_class_f1": {
+    "idle": 0.8905697206294986,
+    "concentric": 0.7992209631728046,
+    "eccentric": 0.8570619067856636
+  },
+  "macro_f1": 0.8489508635293223,
+  "rep_count_mae": 0.2,
+  "n_test_sequences": 100
+}

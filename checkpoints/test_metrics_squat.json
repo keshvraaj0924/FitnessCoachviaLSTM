@@ -1,0 +1,11 @@
+{
+  "exercise": "squat",
+  "per_class_f1": {
+    "idle": 0.8134093819113026,
+    "concentric": 0.7385752688172043,
+    "eccentric": 0.7715952753664437
+  },
+  "macro_f1": 0.7745266420316502,
+  "rep_count_mae": 0.16,
+  "n_test_sequences": 100
+}

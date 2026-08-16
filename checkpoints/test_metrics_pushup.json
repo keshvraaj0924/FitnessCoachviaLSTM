@@ -1,0 +1,11 @@
+{
+  "exercise": "pushup",
+  "per_class_f1": {
+    "idle": 0.8583362339018448,
+    "concentric": 0.7675579322638146,
+    "eccentric": 0.8148753575807111
+  },
+  "macro_f1": 0.8135898412487901,
+  "rep_count_mae": 0.12,
+  "n_test_sequences": 100
+}
