@@ -1,0 +1,42 @@
+# Ruff configuration for the Exercise Analysis project.
+#
+# The goal is PEP8-clean, readable code. We select rules that catch real
+# problems (style E/W, pyflakes F, import sorting I, modern annotations UP,
+# bugbear B, security S, simplify SIM, try/except TRY, ruff RUF) and skip the
+# opinionated pylint-style bikesheds (PLC/PLR: too-many-arguments, magic
+# values) that add noise without catching bugs.
+
+line-length = 100
+target-version = "py310"
+
+[lint]
+select = ["E", "W", "F", "I", "UP", "B", "S", "SIM", "TRY", "RUF"]
+# Opinionated rules that fight intentional patterns in this codebase:
+#   B008   - FastAPI's `Depends()`/`File()` default-argument idiom is the
+#            required framework pattern.
+#   BLE001 - Defensive `except Exception` in fallback/teardown paths is
+#            deliberate (coaching fallback, disconnect cleanup).
+#   S110   - `try/except/pass` when best-effort-sending a final WS message.
+#   SIM102 - Nested `if`s in the rep-counting state machine are kept nested so
+#            the per-state transitions read as a small table.
+#   SIM105 - Same intent as S110 (suppress is fine but try/pass is clearer here).
+#   S101   - `assert` is idiomatic in tests; we don't need `unittest.assert*`.
+#   S701   - jinja2 autoescape is irrelevant: coach_v1.md is our own prompt.
+#   B905   - `zip()` strictness: the tight loops here always pair 1:1 by design.
+#   TRY003 - Long exception messages are a style preference, not a bug.
+#   E501   - A few long URLs/prompt strings are clearer than broken up.
+#   TRY300 - `return` after the risky call inside `try` is idiomatic here.
+#   S104   - Binding the server to 0.0.0.0 is intentional (Docker).
+ignore = [
+    "B008", "BLE001", "S110", "SIM102", "SIM105",
+    "S101", "S701", "B905", "TRY003", "E501", "TRY300", "S104",
+]
+
+[lint.per-file-ignores]
+# pytest.raises(Exception) is acceptable in tests that just assert "it raised".
+"tests/*" = ["B017"]
+# The datasets are generated internally by this repo; loading our own pickles
+# is trusted input, so the pickle-security rule is noise here.
+"generate_synthetic_data.py" = ["S301"]
+"scripts/make_demo_video.py" = ["S301"]
+

@@ -1,0 +1,34 @@
+# Secrets — never bake credentials into an image
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Trained artifacts / data.
+# The checkpoints ARE copied into the image (2MB total — the models are needed
+# at runtime); the raw datasets are not (60MB of training material, not needed
+# for inference).
+data/
+exercises-dataset/
+
+# Assessment scratch / large datasets
+*.docx
+*.doc
+test_debug.py
+TODO.md
+mm-fit/
+
+# Git / OS / editor
+.git/
+.gitignore
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

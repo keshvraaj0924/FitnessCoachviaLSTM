@@ -1,0 +1,36 @@
+# Secrets — never commit credentials
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Trained artifacts / data
+checkpoints/
+data/
+exercises-dataset/
+
+# Assessment scratch
+*.docx
+*.doc
+test_debug.py
+TODO.md
+
+# Large unprocessed datasets (not part of the submission)
+mm-fit/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Server logs
+*.log
