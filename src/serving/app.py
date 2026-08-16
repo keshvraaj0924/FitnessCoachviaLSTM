@@ -442,7 +442,9 @@ class LiveSessionResponse(BaseModel):
     type: Literal["frame"] = "frame"
     t_s: float
     phase: str
+    phase_id: int
     confidence: float
+    rep_count: int
     rep_count: int
 
 
