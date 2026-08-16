@@ -445,7 +445,6 @@ class LiveSessionResponse(BaseModel):
     phase_id: int
     confidence: float
     rep_count: int
-    rep_count: int
 
 
 class LiveStartResponse(BaseModel):
@@ -515,6 +514,7 @@ async def live_frame(
         return LiveSessionResponse(
             t_s=session.extractor.sample_count / session.registry._settings_target_fps(),
             phase="idle",
+            phase_id=0,
             confidence=0.0,
             rep_count=session.counter.rep_count,
         )
@@ -524,6 +524,7 @@ async def live_frame(
         return LiveSessionResponse(
             t_s=session.extractor.sample_count / session.registry._settings_target_fps(),
             phase="idle",
+            phase_id=0,
             confidence=0.0,
             rep_count=session.counter.rep_count,
         )
@@ -531,6 +532,7 @@ async def live_frame(
     return LiveSessionResponse(
         t_s=result["t_s"],
         phase=result["phase"],
+        phase_id=result["phase_id"],
         confidence=result["confidence"],
         rep_count=result["rep_count"],
     )
