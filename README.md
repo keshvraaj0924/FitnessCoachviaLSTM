@@ -407,9 +407,3 @@ mypy src/
 1. Create `prompts/coach_v2.md` following the same format
 2. Update `summarize()` call to use `prompt_version="v2"`
 3. Add a mock-client test in `tests/test_coach.py` (no network)
-
----
-
-## License
-
-Assessment submission for AerioneBharat AI Engineer position.
