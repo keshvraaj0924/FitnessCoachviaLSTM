@@ -128,10 +128,11 @@ class RepCounter:
         """
         phase = Phase(predicted_phase)
 
-        # Confidence gate: low-confidence predictions do not trigger a
-        # transition — absorb them into the current state so a wobbly idle
-        # does not spawn phantom concentric/eccentric runs.
-        if confidence is not None and confidence < self.confidence_threshold:
+        # Confidence gate: low-confidence non-idle predictions are absorbed
+        # into the current state to suppress noisy concentric/eccentric runs.
+        # Idle predictions are always trusted — ending a rep early is less
+        # harmful than never completing one.
+        if confidence is not None and phase != Phase.IDLE and confidence < self.confidence_threshold:
             phase = self.state
 
         # Same as committed state: nothing to debounce. Clear the pending-run

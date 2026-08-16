@@ -74,9 +74,16 @@ class StreamSession:
         self._auto_window = int(self.target_fps * 1.5)
         # Minimum mean non-idle confidence (across the window) to declare a
         # detection and switch exercise.
-        self._auto_confidence_threshold = 0.55
+        self._auto_confidence_threshold = 0.70
+        # Minimum margin between the best and second-best exercise to avoid
+        # flapping when several models produce similar scores on ambiguous input.
+        self._auto_margin = 0.08
+        # Cooldown: once an exercise is detected, don't re-evaluate for this
+        # many seconds so the rep counter can accumulate a full rep cycle.
+        self._auto_cooldown_s = 5.0
         # Ring buffer of recent features for auto-detect.
         self._auto_feature_buffer: list[np.ndarray] = []
+        self._auto_locked_until: float = 0.0  # time.perf_counter() deadline
 
     def _maybe_auto_detect(self, feature: np.ndarray) -> None:
         """If exercise is 'auto', accumulate features and trigger detection.
@@ -101,24 +108,34 @@ class StreamSession:
 
         def _evaluate():
             try:
-                best_exercise = self.exercise_id
-                best_conf = 0.0
+                scores = {}
                 for ex_id in self.registry._models.keys():
                     logits_arr, _ = self.registry.predict(feats, ex_id)
                     probs = _stable_softmax(logits_arr[0], axis=-1)
                     idle_mask = probs.argmax(axis=-1) != 0
                     mean_non_idle = (float(probs[idle_mask].max(axis=-1).mean())
                                      if idle_mask.any() else 0.0)
-                    if mean_non_idle > best_conf:
-                        best_conf = mean_non_idle
-                        best_exercise = ex_id
+                    scores[ex_id] = mean_non_idle
 
-                if best_conf >= self._auto_confidence_threshold and best_exercise != self.exercise_id:
+                ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+                best_exercise, best_conf = ranked[0]
+                runner_up_conf = ranked[1][1] if len(ranked) > 1 else 0.0
+                margin = best_conf - runner_up_conf
+
+                # Require: high confidence AND a clear margin over the runner-up
+                # AND outside the cooldown window since last switch.
+                now = time.perf_counter()
+                cooldown_ok = now > self._auto_locked_until
+                if (best_exercise != self.exercise_id
+                        and best_conf >= self._auto_confidence_threshold
+                        and margin >= self._auto_margin
+                        and cooldown_ok):
                     logger.info(
                         f"Auto-detect: switching from {self.exercise_id} to "
-                        f"{best_exercise} (conf={best_conf:.2f})"
+                        f"{best_exercise} (conf={best_conf:.2f}, margin={margin:.2f})"
                     )
                     self.exercise_id = best_exercise
+                    self._auto_locked_until = now + self._auto_cooldown_s
                     self._switch_exercise()
             finally:
                 self._auto_pending = False
@@ -144,6 +161,8 @@ class StreamSession:
         self.n_frames = 0
         self._non_idle_conf = []
         self._auto_feature_buffer = []
+        self._auto_locked_until = 0.0
+        self._auto_pending = False
 
     def process_frame_bytes(self, jpeg_bytes: bytes) -> dict | None:
         """Decode one JPEG frame, extract a feature, run the LSTM step.

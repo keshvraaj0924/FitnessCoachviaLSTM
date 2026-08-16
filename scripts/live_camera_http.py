@@ -184,11 +184,9 @@ def main():
         cap.release()
         cv2.destroyAllWindows()
 
-        # Wait for all pending frames to complete (with timeout)
-        print(f"\nWaiting for {len(pending)} pending frames...")
-        if pending:
-            concurrent.futures.wait(pending, timeout=10)
-            _drain_results()
+        # Drain any completed results (don't wait — server already processed
+        # all frames, we just collect final rep count for display).
+        _drain_results()
 
         pool.shutdown(wait=False)
 
