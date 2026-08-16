@@ -4,12 +4,15 @@ Usage:
     python scripts/live_camera_http.py --exercise pushup
     python scripts/live_camera_http.py --exercise auto --source-fps 30
 
-Press 'q' in the OpenCV window to stop and get the final result.
+Press 'q' in the OpenCV window or Ctrl+C in the terminal to stop cleanly.
 """
 import argparse
 import concurrent.futures
 import json
+import signal
 import sys
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -17,31 +20,21 @@ import urllib.request
 import cv2
 
 DEFAULT_BASE_URL = "http://localhost:8000"
-
-# Pool of background workers — each frame is POSTed in its own thread
-# so the camera loop never blocks on a round-trip.
 _FRAME_WORKERS = 4
+_STOP_TIMEOUT_S = 8
 
 
-def _post_json(url: str, data: dict) -> dict:
-    body = json.dumps(data).encode()
-    req = urllib.request.Request(url, data=body, method="POST")
-    req.add_header("Content-Type", "application/json")
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        return {"error": f"HTTP {e.code}", "detail": e.read().decode()[:200]}
-
-
-def _post_raw(url: str, raw_bytes: bytes) -> dict:
+def _post_raw(url: str, raw_bytes: bytes, timeout: float = 5.0) -> dict:
+    """POST raw JPEG bytes, return JSON response or error dict."""
     req = urllib.request.Request(url, data=raw_bytes, method="POST")
     req.add_header("Content-Type", "image/jpeg")
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         return {"error": f"HTTP {e.code}", "detail": e.read().decode()[:200]}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 def start_session(base_url: str, exercise: str, source_fps: float) -> str | None:
@@ -67,137 +60,199 @@ def start_session(base_url: str, exercise: str, source_fps: float) -> str | None
 
 def stop_session(base_url: str, session_id: str) -> dict:
     """Stop session and return the final AnalyzeResponse."""
+    req = urllib.request.Request(
+        f"{base_url}/v1/live/{session_id}/stop",
+        data=b"",
+        method="POST",
+    )
     try:
-        req = urllib.request.Request(
-            f"{base_url}/v1/live/{session_id}/stop",
-            data=b"",
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=_STOP_TIMEOUT_S) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         return {"error": f"HTTP {e.code}", "detail": e.read().decode()[:200]}
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Live camera rep counter (HTTP)")
-    parser.add_argument("--exercise", default="pushup", help="Exercise id (or 'auto')")
-    parser.add_argument("--source-fps", type=float, default=30.0, help="Camera FPS")
-    parser.add_argument("--camera", type=int, default=0, help="Camera index")
-    parser.add_argument("--url", default=DEFAULT_BASE_URL, help="Server base URL")
-    args = parser.parse_args()
-    base_url = args.url.rstrip("/")
+class LiveCameraClient:
+    """Encapsulates the live-camera session lifecycle."""
 
-    # Start session
-    session_id = start_session(base_url, args.exercise, args.source_fps)
-    if session_id is None:
-        sys.exit(1)
+    def __init__(self, base_url: str, exercise: str, source_fps: float,
+                 camera: int = 0):
+        self.base_url = base_url
+        self.exercise = exercise
+        self.source_fps = source_fps
+        self.camera_idx = camera
 
-    # Open camera
-    cap = cv2.VideoCapture(args.camera)
-    if not cap.isOpened():
-        print("Cannot open camera")
-        stop_session(base_url, session_id)
-        sys.exit(1)
+        self.session_id: str | None = None
+        self.cap: cv2.VideoCapture | None = None
+        self.pool: concurrent.futures.ThreadPoolExecutor | None = None
+        self.pending: list[concurrent.futures.Future] = []
+        self._shutdown_event = threading.Event()
+        self._lock = threading.Lock()
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        # Display state (updated from completed futures)
+        self.last_rep_count = 0
+        self.last_phase = "idle"
+        self.last_conf = 0.0
+        self.frames_sent = 0
 
-    window = f"Live {args.exercise} — press q to stop"
-    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+    # ── session lifecycle ──────────────────────────────────────────────
 
-    # Thread pool for concurrent frame uploads — camera never waits for
-    # the server round-trip.  Results are collected as futures complete.
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=_FRAME_WORKERS)
-    pending: list[concurrent.futures.Future] = []
+    def start(self) -> bool:
+        """Open camera, start session, launch worker pool. Returns False on failure."""
+        self.session_id = start_session(self.base_url, self.exercise, self.source_fps)
+        if self.session_id is None:
+            return False
 
-    last_rep_count = 0
-    last_phase = "idle"
-    last_conf = 0.0
-    frames_sent = 0
+        self.cap = cv2.VideoCapture(self.camera_idx)
+        if not self.cap.isOpened():
+            print("Cannot open camera")
+            self._cleanup_session()
+            return False
 
-    def _submit_frame(jpeg_bytes: bytes):
-        """Submit a frame for async upload, update display state on completion."""
-        fut = pool.submit(_post_raw,
-                          f"{base_url}/v1/live/{session_id}/frame",
-                          jpeg_bytes)
-        pending.append(fut)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-    def _drain_results():
+        self.pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=_FRAME_WORKERS,
+            thread_name_prefix="frame_upload",
+        )
+        return True
+
+    def stop(self):
+        """Clean shutdown: stop camera, flush pool, stop session, print results."""
+        print("\nShutting down...")
+        self._shutdown_event.set()
+
+        # 1. Release camera and destroy windows
+        self._release_camera()
+
+        # 2. Cancel pending futures and shutdown pool (non-blocking)
+        if self.pool is not None:
+            for fut in self.pending:
+                fut.cancel()
+            self.pending.clear()
+            self.pool.shutdown(wait=False, cancel_futures=True)
+            self.pool = None
+
+        # 3. Stop session on server
+        if self.session_id:
+            sid = self.session_id
+            self.session_id = None
+            print(f"Stopping session {sid}...")
+            result = stop_session(self.base_url, sid)
+            self._print_result(result)
+
+    # ── frame loop ─────────────────────────────────────────────────────
+
+    def run_loop(self):
+        """Main camera loop. Returns when user quits."""
+        window = f"Live {self.exercise} — press q to stop"
+        cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+
+        print("\nCamera active. Press 'q' to stop and get results.\n")
+
+        try:
+            while not self._shutdown_event.is_set():
+                ret, frame = self.cap.read()
+                if not ret:
+                    print("Failed to read frame from camera")
+                    break
+
+                # Encode to JPEG
+                ok, jpeg = cv2.imencode(".jpg", frame,
+                                        [cv2.IMWRITE_JPEG_QUALITY, 75])
+                if not ok:
+                    continue
+
+                # Fire-and-forget: submit frame to background pool
+                self._submit_frame(jpeg.tobytes())
+                self.frames_sent += 1
+
+                # Drain completed results (non-blocking)
+                self._drain_results()
+
+                # Overlay status on frame
+                display = frame.copy()
+                cv2.putText(display, f"Reps: {self.last_rep_count}", (10, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+                cv2.putText(display, f"Phase: {self.last_phase}", (10, 80),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+                cv2.putText(display, f"Conf: {self.last_conf:.2f}", (10, 115),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
+                cv2.putText(display, f"Sent: {self.frames_sent}", (10, 145),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (150, 150, 150), 1)
+                cv2.putText(display, f"Pending: {len(self.pending)}", (10, 170),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
+
+                cv2.imshow(window, display)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q") or key == 27:
+                    break
+
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self._release_camera()
+
+    # ── internal helpers ───────────────────────────────────────────────
+
+    def _submit_frame(self, jpeg_bytes: bytes):
+        """Submit a frame for async upload."""
+        if self.pool is None:
+            return
+        url = f"{self.base_url}/v1/live/{self.session_id}/frame"
+        fut = self.pool.submit(_post_raw, url, jpeg_bytes)
+        with self._lock:
+            self.pending.append(fut)
+
+    def _drain_results(self):
         """Collect any completed futures and update display state."""
-        nonlocal last_rep_count, last_phase, last_conf
-        still_pending = []
-        for fut in pending:
-            if fut.done():
-                try:
-                    r = fut.result()
-                    if r and "rep_count" in r:
-                        last_rep_count = r["rep_count"]
-                        last_phase = r.get("phase", "?")
-                        last_conf = r.get("confidence", 0.0)
-                except Exception:
-                    pass
-            else:
-                still_pending.append(fut)
-        pending[:] = still_pending
+        with self._lock:
+            still_pending = []
+            for fut in self.pending:
+                if fut.done():
+                    try:
+                        r = fut.result()
+                        if r and "rep_count" in r:
+                            self.last_rep_count = r["rep_count"]
+                            self.last_phase = r.get("phase", "?")
+                            self.last_conf = r.get("confidence", 0.0)
+                    except Exception:
+                        pass
+                else:
+                    still_pending.append(fut)
+            self.pending = still_pending
 
-    print("\nCamera active. Press 'q' to stop and get results.\n")
+    def _release_camera(self):
+        """Release camera and close all OpenCV windows (idempotent)."""
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+            self.cap = None
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
 
-    try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                print("Failed to read frame")
-                break
+    def _cleanup_session(self):
+        """Best-effort session cleanup if start fails partway."""
+        self._release_camera()
+        if self.session_id and self.base_url:
+            try:
+                stop_session(self.base_url, self.session_id)
+            except Exception:
+                pass
 
-            # Encode to JPEG
-            ok, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
-            if not ok:
-                continue
+    @staticmethod
+    def _print_result(result: dict):
+        """Print the final analysis result."""
+        if "error" in result:
+            print(f"Error: {result['error']} — {result.get('detail', '')}")
+            return
 
-            # Fire-and-forget: submit frame to background pool
-            _submit_frame(jpeg.tobytes())
-            frames_sent += 1
-
-            # Drain any completed results (non-blocking)
-            _drain_results()
-
-            # Overlay status on frame
-            display = frame.copy()
-            cv2.putText(display, f"Reps: {last_rep_count}", (10, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
-            cv2.putText(display, f"Phase: {last_phase}", (10, 80),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
-            cv2.putText(display, f"Conf: {last_conf:.2f}", (10, 115),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
-            cv2.putText(display, f"Sent: {frames_sent}", (10, 145),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (150, 150, 150), 1)
-            cv2.putText(display, f"Pending: {len(pending)}", (10, 170),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
-
-            cv2.imshow(window, display)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q") or key == 27:
-                break
-
-    finally:
-        cap.release()
-        cv2.destroyAllWindows()
-
-        # Drain any completed results (don't wait — server already processed
-        # all frames, we just collect final rep count for display).
-        _drain_results()
-
-        pool.shutdown(wait=False)
-
-    # Stop session and print results
-    print(f"Stopping session {session_id}...")
-    result = stop_session(base_url, session_id)
-
-    if "error" in result:
-        print(f"Error: {result['error']} — {result.get('detail', '')}")
-    else:
-        print("\n" + "=" * 50)
+        print("=" * 50)
         print("FINAL RESULT")
         print("=" * 50)
         print(f"Exercise:   {result.get('exercise', 'N/A')}")
@@ -212,6 +267,51 @@ def main():
         coach = result.get("coaching_feedback", {})
         print(f"\nCoach: {coach.get('summary', 'N/A')}")
         print(f"\nLatency: {result.get('latency_ms', 0)}ms")
+
+
+def _setup_signal_handlers(client: LiveCameraClient):
+    """Handle SIGINT and SIGTERM for graceful shutdown."""
+    def handler(signum, frame):
+        signame = signal.Signals(signum).name
+        print(f"\nReceived {signame} — shutting down gracefully...")
+        client._shutdown_event.set()
+
+    signal.signal(signal.SIGINT, handler)
+    signal.signal(signal.SIGTERM, handler)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Live camera rep counter (HTTP)"
+    )
+    parser.add_argument("--exercise", default="pushup",
+                        help="Exercise id (or 'auto')")
+    parser.add_argument("--source-fps", type=float, default=30.0,
+                        help="Camera FPS")
+    parser.add_argument("--camera", type=int, default=0,
+                        help="Camera index")
+    parser.add_argument("--url", default=DEFAULT_BASE_URL,
+                        help="Server base URL")
+    args = parser.parse_args()
+    base_url = args.url.rstrip("/")
+
+    client = LiveCameraClient(
+        base_url=base_url,
+        exercise=args.exercise,
+        source_fps=args.source_fps,
+        camera=args.camera,
+    )
+    _setup_signal_handlers(client)
+
+    if not client.start():
+        sys.exit(1)
+
+    try:
+        client.run_loop()
+    finally:
+        client.stop()
+
+    print("Done.")
 
 
 if __name__ == "__main__":
