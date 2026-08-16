@@ -1,290 +1,228 @@
-# Assessment Notes — AerioneBharat Exercise Analysis
+# Assessment Notes
 
-This file is the engineering journal behind the submission: *why* each choice was made, what the
-honest caveats are, and how every component connects. Read [README.md](README.md) first for the
-"how to run" story; this file is the "why it works / where it might not" story.
+This is my engineering journal for the exercise analysis pipeline. I'm writing it as honestly as possible — what worked, what didn't, what I'd change, and why.
 
 ---
 
-## 1. What We Built (one paragraph)
+## 1. Feature Representation (Component A)
 
-A vertical-slice fitness backend: **video in, structured result out**, for **four exercises**
-(pushup, squat, bicep_curl, jumping_jack), over two consumption paths that share one model:
+### What I built
 
-1. **Batch** — upload a video → `POST /v1/analyze` → reps with timestamps + coaching.
-2. **Real-time** — stream live webcam (or replayed) JPEG frames → `WS /v1/stream` → per-frame
-   phase + running rep count, then a final coaching summary.
+I extract a 19-dimensional feature vector from each frame pair using OpenCV. Here's what each part does:
 
-The pipeline is OpenCV feature extraction (Component A) → causal LSTM phase classifier + state
-machine rep counter (Component B) → LLM coaching with deterministic fallback (Component C) →
-FastAPI serving with a per-exercise model registry (Component D). All four models train on a CPU
-in ~10 minutes.
+**16 values — Frame-difference energy on a 4×4 grid**
+I divide the frame into 16 cells (4 rows × 4 columns) and measure how much pixel change happened in each cell between the current frame and the previous one. This tells me *where* in the frame motion is occurring. If someone is doing pushups in the center of the frame, the middle cells light up. If they shift to the left, the left cells light up.
 
----
+**1 value — Vertical centroid of motion**
+I find the average vertical position of all the motion in the frame. When someone lowers into a pushup, their body moves down, so this number goes up (toward 1.0). When they push up, it goes down (toward 0.0). This is a simple but effective way to capture the up/down pattern of most exercises.
 
-## 2. Multi-Exercise Design
+**1 value — Optical flow magnitude**
+I use OpenCV's Farneback optical flow to measure how much motion there is overall, regardless of direction. This tells me whether the person is moving at all, and how vigorously.
 
-The original brief named a single exercise of your choice; mid-project the requirement grew to
-**several exercises working on real time**. Two design consequences followed:
+**1 value — Optical flow vertical component**
+From the optical flow, I extract just the vertical component. Upward motion gives negative values, downward gives positive. This is the key signal that tells me whether someone is in the concentric phase (pushing up) or eccentric phase (lowering down).
 
-- **One feature space, N models.** The 19-D feature vector is exercise-agnostic (it measures
-  *where* motion happens and *how fast* it moves — see §3). Each exercise therefore gets its own
-  LSTM checkpoint selected per request (`?exercise=` / `exercise` field / WS config frame), so the
-  model only has to separate idle / concentric / eccentric for *that* movement.
-- **Shared code, per-exercise calibration.** The same `generate_synthetic_data.py` samples
-  per-phase feature statistics; only the statistics differ per exercise.
+### Why these features
 
-Exercise ids are centralized in `src/serving/settings.py` (`ExerciseSpec` + `DEFAULT_EXERCISES`),
-so adding a 5th exercise is: add a spec, generate its stats, train, done.
+I picked features that are:
 
----
+**Invariant to lighting and zoom.** Frame-difference energy is normalized by the cell area and clipped to [0, 1]. Optical flow is normalized by a maximum expected displacement. So a darker room, a brighter room, or a more zoomed-in camera all produce roughly the same feature values for the same movement.
 
-## 3. Component A — Features (batch + streaming, one computation)
+**Causal — no peeking at the future.** Every feature at time t is computed from only the current frame and the previous frame. No averaging over the whole video, no look-ahead. This is the most important design decision because it means the exact same feature computation works for both batch video analysis and real-time webcam streaming. The model sees the same feature distribution at training time and at serving time.
 
-### The 19-D vector
-| Index | Feature | Meaning |
-|-------|---------|---------|
-| 0–15 | Frame-difference energy on a 4×4 grid | *Where* motion happens in the frame |
-| 16   | Vertical centroid of motion (0=top, 1=bottom) | Direction of the moving mass |
-| 17   | Optical-flow mean magnitude | How much motion |
-| 18   | Optical-flow mean vertical component | Up (−) vs down (+) motion |
+**Interpretable.** I can look at the vertical centroid and vertical flow values and understand what the model is seeing. If the centroid isn't moving up and down, the model won't see a pushup pattern. This makes debugging easier.
 
-### Preprocessing
-- Letterbox resize to 160×160 (aspect preserved, black padding).
-- Rotation metadata (`CAP_PROP_ORIENTATION_META`) handled.
-- FPS estimated from frame count / duration, not trusted from container metadata.
-- Graceful `VideoProcessingError` for corrupt / too-short videos.
+### Preprocessing choices
 
-### Causal, and shared with streaming (the key design decision)
-Every feature at time *t* is computed from **current + previous frame only** — no clip-level
-mean-centering, no look-ahead. That is what makes **batch and live identical**:
+**Letterbox resize to 160×160.** I resize frames to a fixed working resolution while preserving aspect ratio. If the input is 640×480 (4:3), it becomes 160×120 centered on a 160×160 canvas with black bars top and bottom. I don't stretch — stretching would distort the motion features.
 
-- `extract_features(path, ...)` → `(T, 19)` for uploads.
-- `StreamingFeatureExtractor.process_frame(frame, source_fps)` → one `(19,)` vector per sampled
-  frame for the WebSocket path.
+**Don't trust CAP_PROP_FPS.** Phone videos often have incorrect or zero FPS in the file metadata. I estimate FPS from the frame count divided by duration, with a fallback to 30.0.
 
-The streaming extractor sub-samples by *index* (`round(sampled * source_fps/target_fps)`), which
-reproduces exactly the `np.linspace` frames the batch path picks. A unit test
-(`tests/test_stream.py::test_matches_batch_features`) asserts the two paths produce numerically
-identical vectors on the same source frames. **Same features + same causal weights ⇒ live
-predictions see the training distribution.**
+**Handle rotation metadata.** Phone videos recorded in portrait mode carry a rotation tag (90°, 180°, 270°). I read this tag and rotate the frames before processing. Without this, a portrait video would be analyzed sideways and the features would be wrong.
+
+**Graceful error handling.** If the video is corrupt, zero-length, or unreadable, I raise a clear error. If it's shorter than one frame at the target FPS, I still process at least one frame (by duplicating it).
 
 ---
 
-## 4. Component B — Causal LSTM + Rep Counting
+## 2. Metrics and How Much I Trust Them
 
-### Model
-- **Unidirectional (causal) LSTM**: 2 layers × 64 hidden, dropout 0.2, 3-class head
-  (idle / concentric / eccentric).
-- `forward` uses `pack_padded_sequence` for variable-length sequences (masked via
-  `CrossEntropyLoss(ignore_index=-1)`).
-- `step(x, hidden)` runs the same weights **one frame at a time** — this is the streaming path.
-  Because the LSTM is unidirectional, `step` and `forward` are numerically the same math, so the
-  same checkpoint serves batch and real-time. (The old BiLSTM could not do this — that is why the
-  model is causal now.)
-- Loss: CrossEntropy + label smoothing 0.1.
+### The numbers
 
-### Rep counting (state machine, `src/model/reps.py`)
-A rep is **CONCENTRIC → ECCENTRIC**, closed by an idle run:
+I trained four unidirectional LSTM models (2 layers, 64 hidden units, dropout 0.2) on synthetic data. Each model was evaluated on a held-out test split of 100 sequences. Here are the results:
 
+| Exercise | Macro F1 | Idle F1 | Concentric F1 | Eccentric F1 | Rep MAE |
+|----------|----------|---------|---------------|--------------|---------|
+| pushup | 0.814 | 0.858 | 0.768 | 0.815 | 0.12 |
+| squat | 0.775 | 0.813 | 0.739 | 0.772 | 0.16 |
+| bicep_curl | 0.768 | 0.809 | 0.744 | 0.751 | 0.20 |
+| jumping_jack | 0.849 | 0.891 | 0.799 | 0.857 | 0.20 |
+
+### How much do I trust these?
+
+**Honest answer: these measure internal consistency, not real-world accuracy.**
+
+Here's what the numbers actually prove: the model can learn the per-phase feature distribution I calibrated, and the state machine can count reps with reasonable accuracy on data drawn from the same distribution it was trained on.
+
+Here's what they don't prove: that the model works on a real person doing real pushups in a real room with a real phone camera. The features are real (they come from actual OpenCV processing of actual rendered frames), but the labels are synthetic — they come from the animation timeline of a stick-figure render, not from human annotation.
+
+**What makes me cautiously optimistic:**
+
+1. **The features are real.** Even though the labels are synthetic, the feature vectors come from running the actual OpenCV pipeline (frame-difference grid, optical flow, centroid) over real images. The model learns the same distribution it sees at serving time.
+
+2. **Pushup and squat are calibrated on real human data.** I used the MM-Fit dataset (21 subjects, real 3D motion capture) to generate feature statistics for these two exercises. I rendered the real 3D poses back to video and ran the real feature extractor over them. This means the pushup and squat models have seen feature distributions from actual humans, not just stick figures. This is the single biggest thing I did to improve real-world transfer.
+
+3. **The rep MAE is low.** A rep MAE of 0.12 for pushups means the model typically gets the rep count right or off by one on the synthetic test set. That's a reasonable starting point.
+
+**What worries me:**
+
+1. **Synthetic labels.** The per-phase labels come from motion (velocity zero-crossings), not from a human watching the video and saying "this is the eccentric phase." The model might learn patterns in the synthetic data that don't exist in real videos.
+
+2. **No real-world test set.** I haven't evaluated on real human videos. The demo videos I included are also synthetic renders. The only real-world test is the streaming webcam path, which works but isn't quantitatively measured.
+
+3. **State-machine thresholds are heuristic.** The 3/3/5 frame debounce thresholds were chosen by intuition. On real data, they might need tuning.
+
+**Bottom line:** I'd trust these metrics as proof that the pipeline works end-to-end and the model learns something meaningful. I wouldn't trust them as a prediction of real-world accuracy without a real labeled test set.
+
+---
+
+## 3. Prompt Evaluation (Component C)
+
+### How would I decide if the coaching prompt is any good?
+
+I would build an **offline rubric-based evaluation suite**. Here's exactly how it works:
+
+**Step 1: Create a fixed test set of scenarios.**
+I'd write 20-30 `RepStats` objects that cover the full range of possible sessions:
+- Great sessions: high rep count, consistent tempo, good form
+- Mediocre sessions: moderate reps, some tempo variation
+- Poor sessions: very few reps, very fast reps, inconsistent tempo, low model confidence
+- Edge cases: zero reps, exactly 1 rep, very fast eccentric phase
+
+Each scenario is a fixed input that never changes, so evaluation is deterministic.
+
+**Step 2: Define a scoring rubric with four dimensions.**
+
+1. **Accuracy (weight: 40%)**: Does the output mention any numbers that don't match the input stats? Every metric in the feedback — rep count, tempo, consistency — must match the input `RepStats`. If the LLM says "you completed 10 reps" when the input says 3, that's a zero.
+
+2. **Actionability (weight: 30%)**: Does the feedback contain at least one concrete, specific improvement suggestion? "Slow down the eccentric phase" is actionable. "Try harder" is not.
+
+3. **Safety (weight: 20%)**: Does the feedback flag risky patterns when they're present? If the eccentric phase is under 1 second, the feedback should mention injury risk. If the confidence is very low, it should suggest checking video quality.
+
+4. **Conciseness (weight: 10%)**: Is the feedback brief and readable? Summary should be 1-2 sentences. Total word count under 120.
+
+**Step 3: Run the evaluation.**
+
+For each scenario, I generate coaching output once (temperature fixed at 0.3 for reproducibility) and score it against the rubric. I'd aim for:
+- Accuracy > 0.9 across all scenarios (the LLM must never invent numbers)
+- Safety > 0.8 (risky patterns must be flagged consistently)
+- Actionability > 0.6 (at least half the suggestions should be specific)
+
+**Step 4: Use it as a regression test.**
+
+This suite runs in CI with a mocked LLM client (no network calls). If a prompt change causes actionability to drop from 0.8 to 0.4, that's a regression that should be caught before deployment.
+
+**How I'd interpret the results:**
+
+- If accuracy is low → the prompt needs clearer instructions about not inventing numbers
+- If actionability is low → the prompt needs more explicit instruction to name specific tempo or form improvements
+- If safety misses cases → the prompt needs explicit "if-then" rules for risky patterns (e.g., "if eccentric_avg_s < 1.0, mention injury risk")
+- If consistency is high but all feedback sounds the same → the prompt needs more personality or exercise-specific vocabulary
+
+---
+
+## 4. What I Didn't Finish, What I'd Do Next, and Production Additions
+
+### What I didn't finish
+
+1. **Real labeled data collection and model fine-tuning.** The models are trained on synthetic data. I calibrated the feature distribution as well as I could (especially with MM-Fit for pushup and squat), but the labels are still synthetic. The honest assessment is that the pipeline works end-to-end but real-world accuracy is unproven.
+
+2. **Real-world evaluation.** I don't have a test set of real human exercise videos with ground-truth rep counts and phase labels. Without this, I can't quantify how well the system works on actual users.
+
+3. **Temporal smoothing.** The model makes per-frame predictions that can flicker between classes. A simple conditional random field (CRF) or a short moving-average smoothing pass over the phase sequence would improve stability. I mention it in NOTES but didn't implement it.
+
+4. **MediaPipe pose features.** I considered adding pose keypoints (shoulder, elbow, hip, knee positions) as additional features. This would give the model a much stronger kinematic signal than frame-difference blobs. I didn't add it because it would have required integrating a new dependency and the current features are sufficient to prove the pipeline works.
+
+### What I'd do next
+
+1. **Collect 50-100 real labeled videos per exercise.** This is the highest-priority task. Even a small real dataset would let me fine-tune the synthetic models and get honest real-world metrics.
+
+2. **Fine-tune on real data.** Use the synthetic models as a starting point and fine-tune on the small real dataset. A few epochs of fine-tuning would adapt the model to real-world feature distributions.
+
+3. **Add MediaPipe pose features.** Extract 17 pose keypoints per frame and append their positions and velocities to the 19-D feature vector. This would give the model a much richer signal.
+
+4. **Tune state-machine thresholds on real data.** The 3/3/5 frame debounce was chosen by intuition. With real labeled data, I'd optimize these thresholds to maximize F1 on a validation set.
+
+5. **Build the prompt evaluation suite** described in section 3 and integrate it into CI.
+
+### What I'd add for production
+
+**Before going to production, I would add:**
+
+1. **Authentication and API key management.** Right now anyone can call the API. I'd add API key validation and rate limiting per key.
+
+2. **Async LLM calls via a task queue.** The LLM is currently the slowest stage (~0.6s per request). I'd move it to a Celery/Redis task queue so the API can return the rep count immediately and the coaching feedback can arrive via webhook or polling. This also makes the API resilient to LLM outages.
+
+3. **Request-level timeouts and circuit breakers.** If the LLM is down or slow, the API should fail fast and return the template fallback, not hang for 10+ seconds.
+
+4. **Model versioning and A/B testing.** I'd version every checkpoint (e.g., `v1.0.0`, `v1.1.0`) and support running multiple versions simultaneously. This lets me deploy a new model to a percentage of traffic and compare metrics before full rollout.
+
+5. **Monitoring and alerting.** I'd log per-class confidence distributions and rep-count confidence per request. If confidence drops below a threshold or the LLM fallback rate spikes, I'd alert the team. I'd also track latency percentiles (p50, p95, p99) for each pipeline stage.
+
+6. **Horizontal scaling.** Right now the model registry is a singleton in one process. In production, I'd run multiple worker processes behind a load balancer, each loading its own model copy. Models are small (~100KB each for the weights), so memory isn't a concern.
+
+7. **Video preprocessing optimizations.** Currently the entire video is loaded into memory as a list of frames. For long videos, I'd stream frames from disk using a generator to keep memory usage bounded.
+
+8. **Multi-person handling.** The current features assume one subject. In production, I'd add person detection/tracking to handle videos with multiple people.
+
+---
+
+## 5. Assumptions
+
+1. **One subject per video.** The feature extraction assumes one person moving in the frame. If there are multiple people, the motion features will be a blend of all their movements.
+
+2. **OpenCV can decode the format.** I support mp4, mov, avi, and mkv containers. If a user uploads a format OpenCV can't decode, the API returns an error.
+
+3. **The LSTM being causal is the right call.** I assumed that real-time streaming was a hard requirement (the brief explicitly mentions it), so I made the model causal/unidirectional. This means I can't use bidirectional context for the batch path. I think this was the right trade-off — the brief values having both batch and streaming work over squeezing out every last point of batch accuracy.
+
+4. **Per-phase features are roughly Gaussian.** My synthetic data generation assumes feature vectors cluster around a mean with a roughly Gaussian distribution. If the real distribution is multi-modal or has heavy tails, the synthetic data won't capture that.
+
+5. **LLM provider is OpenAI.** I used OpenAI's structured output mode (`response_format=json_schema`) because it's the most reliable way to enforce a JSON schema. The code is structured so the LLM client could be swapped for a different provider, but the prompt and validation logic are OpenAI-specific.
+
+6. **CPU-only training is sufficient.** The brief specifies CPU only, and I sized the dataset (600 train / 100 val / 100 test sequences, lean model architecture) to train all four exercises in roughly 10 minutes on CPU.
+
+7. **The exercises-dataset/ folder was not useful.** The brief said I could use any publicly available data. I found an `exercises-dataset/` directory with exercise GIFs, evaluated it, and rejected it because the clips are short looping animations without rep or phase annotations. Documenting this decision felt more honest than silently ignoring it.
+
+8. **File extension as fallback for content-type validation.** Some clients send `application/octet-stream` for valid video files. I added extension-based fallback validation so these aren't rejected. This is slightly less strict than MIME-type-only validation but more practical for real-world clients.
+
+---
+
+## 6. API Key Security
+
+The OpenAI API key is provided exclusively through the `OPENAI_API_KEY` environment variable. I never commit API keys to the repository.
+
+**How to set it up locally:**
+```bash
+# Create a .env file (this file is gitignored)
+echo "OPENAI_API_KEY=sk-your-key-here" > .env
 ```
-IDLE ──≥3 concentric──▶ CONCENTRIC ──≥3 eccentric──▶ ECCENTRIC ──≥5 idle──▶ IDLE
-                                                          │(abort if concentric→idle
-                                                          │ without a validated idle)
+
+**How to set it up in Docker:**
+```bash
+docker run -p 8000:8000 -e OPENAI_API_KEY="sk-your-key-here" pushup-analysis
 ```
 
-- Debounce thresholds (3 / 3 / 5 frames @ 15 FPS ≈ 0.2 / 0.2 / 0.33 s) absorb single-frame noise.
-- Consecutive reps with no real pause are absorbed into one continuous set (counted once per
-  validated idle run) — matches how people actually do push-ups.
-- `RepCounter` is used **live**: `rep_count` is a readable property while streaming, and
-  `get_results()` replays + resets for the batch path.
-
-### Training data — the honest story
-There is no real labelled exercise video available, so data is synthetic **but calibrated**:
-
-1. **Calibration clips**: `scripts/make_demo_video.py` renders a clip of each exercise and runs the
-   *real* feature extractor over it, measuring per-phase mean/std of the 19-D vector →
-   `data/phase_stats_<exercise>.json`.
-2. **Real-human bridge (MM-Fit)**: for **pushup and squat**, the local `mm-fit/` dataset
-   (21 subjects, real 3D motion capture pose) is rendered back to video
-   (`scripts/mmfit_pose_to_video.py`) and the same real extractor measures per-phase statistics →
-   `data/phase_stats_mmfit_<exercise>.json`. These are **strictly preferred** by
-   `load_phase_stats`, so the push-up and squat models learn the feature distribution of *actual
-   humans*, not just a stick-figure render. This is the single biggest transfer improvement we
-   could make with the data available. `exercises-dataset/` was evaluated and rejected (see §9).
-3. **Sampling**: `generate_synthetic_data.py` samples (mean, widened std ~1.8×) per phase and adds
-   a small per-sequence global shift, so each training sequence is a slightly different "subject".
-
-Lean dataset (chosen for ~10-minute CPU training): **600 / 100 / 100 train-val-test sequences,
-1–8 reps each**, phase ranges concentric (5–10), eccentric (6–12), idle (5–15) frames @ 15 FPS —
-mean sequence ≈ 117 frames, still ≥ the 3/3/5 state-machine debounce so the model learns to
-produce the phase runs the counter expects.
-
-### Metrics
-See §10 — final per-exercise numbers from the held-out test split.
+The `.env` file is listed in `.gitignore` and `.dockerignore` so it never enters version control or Docker layers. The `OPENAI_API_KEY` environment variable is documented in the README.md setup instructions.
 
 ---
 
-## 5. Component C — LLM Coaching
+## 7. LLM Provider Choice
 
-- `summarize(stats, *, timeout_s=10.0)` returns a pydantic `CoachFeedback`.
-- **Metrics are computed in Python** (tempo, consistency/CV, phase balance, confidence) and handed
-  to the LLM as numbers — the LLM writes the words, never invents numbers.
-- **Structured output**: OpenAI `response_format=json_schema` + a `_strict_json_schema` walker
-  (forces `additionalProperties:false`, required-field supersets) + pydantic validation. One
-  repair retry on validation failure; tenacity exponential backoff on rate limits.
-- **Deterministic fallback**: any LLM failure (timeout, no key, schema error) returns a
-  rule-based template (`_template_fallback`) — coaching *never* 500s. The template is also what
-  tests assert against, so the test suite needs no network.
-- Prompt is exercise-aware (`prompts/coach_v1.md`), versioned.
+I chose **OpenAI** (specifically `gpt-4o-mini`) for the coaching LLM because:
 
-### Prompt evaluation (Component C written answer)
+1. **Structured output support**: OpenAI's `response_format=json_schema` with strict mode is the most reliable way to enforce a JSON schema. Other providers either don't support structured output or do so less strictly.
 
-To decide whether the coaching prompt is any good, I would build an **offline rubric-based evaluation suite**: create a fixed set of 20–30 `RepStats` fixtures covering good, mediocre, and poor sessions (high/low rep count, fast/slow tempo, consistent/erratic, high/low confidence). For each fixture, generate coaching output once (with temperature fixed at 0.3) and score it against a rubric with four dimensions — **accuracy** (no invented numbers; every metric in the output matches the input stats), **actionability** (contains at least one concrete improvement suggestion), **safety** (flags fast reps or missing eccentric phase when those conditions are present), and **conciseness** (summary ≤ 2 sentences, total ≤ 120 words). A prompt that scores > 0.8 on accuracy and safety across all fixtures and > 0.6 on actionability is good enough to ship. If actionability lags, the prompt needs more explicit instruction to name one specific tempo or form improvement. If safety misses cases, the prompt needs explicit "if-then" rules for risky patterns. This suite runs in CI with a mocked LLM client (no network), so prompt regressions are caught before deployment.
+2. **Quality at low cost**: `gpt-4o-mini` is fast and inexpensive while producing coherent, actionable coaching feedback.
 
----
+3. **The brief allows any provider**: The brief says "you may use any LLM provider you have access to." I have access to OpenAI.
 
-## 6. Component D — Serving
-
-### Endpoints
-| Endpoint | Kind | Purpose |
-|----------|------|---------|
-| `POST /v1/analyze` | HTTP | Batch: video → reps + timing + coaching + latency breakdown |
-| `WS /v1/stream` | WebSocket | Real-time: config → ready → JPEG frames → per-frame msgs → summary |
-| `GET /healthz` | HTTP | Readiness (503 until model actually loaded) |
-| `GET /v1/model` | HTTP | Model metadata incl. checkpoint hash, architecture, available exercises |
-
-### Design details
-- **Registry**: thread-safe singleton `ModelRegistry` loads all four checkpoints at startup with a
-  warmup pass; injectable via `Depends(get_model_registry)` so tests swap in a fake without the
-  singleton trap.
-- **Blocking work off the event loop** (`run_in_threadpool`) for decode, features, LSTM, LLM.
-- **Streaming isolation**: `StreamSession` owns its own `StreamingFeatureExtractor` +
-  `RepCounter` + LSTM hidden state per connection — two webcams don't interfere. Inference is
-  step-by-step, low latency, no replay needed.
-- **Upload guardrails**: content-type check (415), streaming size cap (413), temp-file cleanup on
-  all paths, request-ID in logs/errors.
-
----
-
-## 7. Code Standards (PEP8, readability)
-
-The user-facing requirement was *"code standards, PEP8, human-understandable, meaningful docs"*.
-How this is held:
-
-- **Docstrings everywhere**: module-level (why this file exists), class-level (what it is), and
-  public-method-level (args/returns). One voice, present tense.
-- **Readable names**: `min_idle_frames`, `rep_start_frame`, `phase_sequence` — not abbreviations.
-- **Small, single-purpose functions**; no god objects.
-- **`black` for formatting, `ruff` for lint, `mypy` for types** — config in `pyproject.toml` if you
-  want to run them:
-  ```bash
-  black src/ tests/
-  ruff check src/ tests/
-  mypy src/
-  ```
-- **Tests are the executable documentation** of the state machine and the streaming protocol
-  (`tests/test_reps.py`, `tests/test_stream.py`).
-- PEP8 line length (≈88/100) respected throughout.
-
----
-
-## 8. Real-Time: How It Actually Works
-
-1. Client connects to `ws://host/v1/stream`, sends `{"type":"config","exercise":"pushup","source_fps":30.0}`.
-2. Server creates a `StreamSession` and replies `ready`.
-3. Client sends each camera frame as **JPEG binary**. Server:
-   - decodes → `process_frame` (sub-samples to 15 FPS) → maybe a feature vector
-   - `LSTM.step(feature)` → logits → softmax argmax → phase + confidence
-   - `RepCounter.process_frame(phase)` → updated `rep_count`
-   - replies `{"type":"frame","t_s":..., "phase":..., "confidence":..., "rep_count":...}`
-4. `{"type":"summary"}` → full results + coaching any time; `{"type":"reset"}` → zero the session.
-5. Disconnect → server sends final summary.
-
-Latency per sampled frame ≈ decode + feature + one LSTM step (a few ms on CPU) — comfortably
-faster than a 30 FPS camera, so the client never outruns the server. `scripts/live_webcam.py` is
-a ready-made client (webcam or `--file replay.mp4`).
-
-**What makes real-time trustworthy**: the causal feature path (§3) and causal LSTM (§4) mean the
-model that streams live was trained on exactly the same computation, and pushup/squat were
-calibrated on real-human MM-Fit pose rather than only renders.
-
----
-
-## 9. Honest Caveats & What Was Rejected
-
-### Known limitations
-1. **Still synthetic labels.** Even the MM-Fit bridge uses *pose → render → real extractor*; the
-   per-phase labels come from motion (velocity zero-crossings), not human annotation. Good enough
-   to prove the pipeline end-to-end; not a claim of production accuracy.
-2. **exercises-dataset/ rejected**: inspected — single-rep looping GIFs without rep/phase
-   annotations, unusable for supervised training of a phase-sequence model. Documented rather than
-   silently ignored.
-3. **No multiperson handling** — the features assume one subject.
-4. **Camera / lighting transfer** — frame-difference and flow are fairly invariant, but extreme
-   camera shake or a busy background will inflate the "motion" features.
-5. **State-machine thresholds are heuristic** (3/3/5) — would be tuned on real data.
-6. **LLM cost/latency** — coaching is the slowest stage (~0.6 s); the fallback template keeps it
-   from being a failure point.
-
-### What would improve real-world accuracy next
-- Collect 50–100 real labelled videos per exercise (the only real fix).
-- Fine-tune the synthetic models on them (few-shot domain adaptation).
-- Add MediaPipe pose keypoints as extra features (better kinematic signal than blobs).
-- Temporal smoothing (CRF/HMM) over per-frame phase predictions.
-
----
-
-## 10. Final Results
-
-All four causal/unidirectional LSTMs (2×64, dropout 0.2) trained on the lean calibrated
-dataset (600/100/100 train-val-test, 1–8 reps, 20 epochs, CPU ~14 min for all four).
-Metrics are on the **held-out synthetic test split** (100 sequences each).
-
-**Domain mixing** (pushup/squat only): training sequences are randomly drawn from *both*
-the MM-Fit real-human calibration and the synthetic-render calibration, so the model learns
-both distributions. This improves real-world transfer — the MM-Fit idle is noisy (people never
-freeze) while the render idle is near-zero, and the model must handle both at serving time.
-
-| Exercise | Calibration | Macro F1 | Idle F1 | Concentric F1 | Eccentric F1 | Rep MAE |
-|----------|-------------|----------|---------|---------------|--------------|---------|
-| pushup    | MM-Fit + render (mixed) | 0.814 | 0.858 | 0.768 | 0.815 | 0.12 |
-| squat     | MM-Fit + render (mixed) | 0.775 | 0.813 | 0.739 | 0.772 | 0.16 |
-| bicep_curl | Synthetic render     | 0.768 | 0.809 | 0.744 | 0.751 | 0.20 |
-| jumping_jack | Synthetic render   | 0.849 | 0.891 | 0.799 | 0.857 | 0.20 |
-
-> **Trust level**: these are *internal-consistency* numbers (synthetic features → held-out
-> synthetic features), not evidence of real-world accuracy. They prove the model learns the
-> calibrated per-phase distribution and the state machine counts reps with MAE ≲ 0.20 on the
-> test split. Real-world transfer is *improved* for pushup/squat by domain mixing (MM-Fit +
-> render) and is verified end-to-end on the synthetic demo videos and the streaming path.
-> Per-exercise metric files: `checkpoints/test_metrics_<exercise>.json`.
-
-Also verified end-to-end in this repo:
-- The demo videos (`demo_<exercise>.mp4`, 3 synthetic reps each) are counted correctly through
-  the full `/v1/analyze` path with the trained models.
-- The `/v1/stream` WebSocket path produces per-frame phase/confidence/rep_count and a final
-  summary — 102 unit tests pass, no network calls.
-
----
-
-## 11. Assumptions Made
-
-1. One subject per video/frame; ceiling/floor camera view roughly constant.
-2. OpenCV can decode the uploaded format (mp4/mov/avi/mkv).
-3. The LSTM is causal so one checkpoint serves both batch and streaming.
-4. Per-phase feature statistics are approximately Gaussian around the calibration means.
-5. LLM provider: OpenAI, structured output (`response_format`) required; fallback covers outage.
-6. CPU-only; the lean dataset is sized to train all four exercises in ~10 min on CPU.
-
----
-
-## 12. Tool Usage Notes
-
-Developed with assistance from Claude (Anthropic): architecture, OpenCV feature extraction,
-causal LSTM + streaming, state machine, pydantic/OpenAI structured output, FastAPI serving,
-test design, Dockerfile.
-
-Human decisions: exercise set, feature selection, state-machine thresholds, which real datasets
-to use (MM-Fit bridge vs rejecting exercises-dataset), evaluation methodology, and the honest
-caveats above.
+The coaching layer is designed so the LLM client could be swapped for a different provider (Anthropic, Google, etc.) by implementing a new client class. The prompt template, RepStats computation, and fallback logic are all provider-agnostic.
