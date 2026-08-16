@@ -69,11 +69,6 @@ class StreamSession:
         self.started = time.perf_counter()
         self.n_frames = 0
         self._non_idle_conf: list[float] = []
-        # Minimum total grid energy (sum of first 16 feature dims) to accept a
-        # non-idle prediction. Real webcam idle has subtle motion that the LSTM
-        # can misclassify; this veto suppresses false concentric/eccentric
-        # predictions when there is barely any frame-difference energy.
-        self._motion_energy_threshold = 0.015
         # Auto-detect: how many features to accumulate before running all-4
         # models.  Set to ~2 seconds of target_fps samples.
         self._auto_window = int(self.target_fps * 1.5)
@@ -108,7 +103,7 @@ class StreamSession:
             try:
                 best_exercise = self.exercise_id
                 best_conf = 0.0
-                for ex_id in self.registry.exercise_ids():
+                for ex_id in self.registry._models.keys():
                     logits_arr, _ = self.registry.predict(feats, ex_id)
                     probs = _stable_softmax(logits_arr[0], axis=-1)
                     idle_mask = probs.argmax(axis=-1) != 0
@@ -188,15 +183,6 @@ class StreamSession:
 
         # If we're in auto mode, check whether we should switch exercises.
         self._maybe_auto_detect(feature)
-
-        # Motion veto: if the frame-difference grid energy is below threshold,
-        # force idle regardless of what the LSTM predicted. Real webcam idle
-        # (breathing, background flicker, slight camera shake) produces tiny
-        # frame differences that the LSTM can misclassify as concentric.
-        motion_energy = float(feature[:16].sum())
-        if motion_energy < self._motion_energy_threshold:
-            phase = 0  # idle
-            confidence = max(confidence, 0.6)  # don't penalize the idle reading
 
         # Feed the state machine with confidence so low-confidence idle noise
         # is absorbed into the current state (prevents phantom rep counts).
